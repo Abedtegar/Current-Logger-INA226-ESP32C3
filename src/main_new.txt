@@ -1,0 +1,456 @@
+// Define HTTP methods BEFORE including ESPAsyncWebServer
+#ifndef HTTP_GET
+#define HTTP_GET 0x01
+#define HTTP_POST 0x02
+#define HTTP_DELETE 0x04
+#define HTTP_PUT 0x08
+#define HTTP_PATCH 0x10
+#define HTTP_HEAD 0x20
+#define HTTP_OPTIONS 0x40
+#define HTTP_ANY 0x7F
+#endif
+
+#include "../include/webserver_fixed.h"
+#include "INA226.h"
+#include <Arduino.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ESPmDNS.h>
+#include <SPIFFS.h>
+#include <WiFi.h>
+#include <Wire.h>
+
+INA226 INA(0x40);
+
+// WiFi STA Settings
+const char *wifi_ssid = "Robotika@test";
+const char *wifi_password = "12345678";
+
+// Web Server
+AsyncWebServer server(80);
+
+// Data Storage - RAM Buffer (ringbuffer untuk data terbaru)
+#define MAX_RAM_POINTS 5000
+struct DataPoint {
+  unsigned long timestamp;
+  float busVoltage;
+  float shuntVoltage;
+  float current;
+  float power;
+};
+
+DataPoint ramBuffer[MAX_RAM_POINTS];
+int ramIndex = 0;
+int ramCount = 0;
+unsigned long startTime = 0;
+unsigned long totalDataPoints = 0;
+
+// SPIFFS file management
+String currentLogFile = "/log_current.csv";
+unsigned long lastSPIFFSSave = 0;
+#define SPIFFS_SAVE_INTERVAL 10000 // Save to SPIFFS every 10 seconds
+
+// Hardware Pins
+#define Buzz 2
+#define Led 1
+#define Alert 10
+#define SDA_PIN 8
+#define SCL_PIN 9
+
+// Global kalibrasi tegangan
+float g_bus_voltage_offset = 0.0;
+float g_bus_voltage_multiplier = 1.0;
+
+// Function declarations
+void readINA226();
+void initialout();
+void initWiFi();
+void initSPIFFS();
+void handleRoot(AsyncWebServerRequest *request);
+void handleData(AsyncWebServerRequest *request);
+void handleInfo(AsyncWebServerRequest *request);
+void handleDownload(AsyncWebServerRequest *request);
+void handleClear(AsyncWebServerRequest *request);
+void addDataPoint(float v, float s, float c, float p);
+void saveToSPIFFS(DataPoint &dp);
+int countSPIFFSLines();
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println();
+  Serial.println("***** CURRENT LOGGER ESP32-C3 *****");
+  Serial.print("INA226_LIB_VERSION: ");
+  Serial.println(INA226_LIB_VERSION);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  if (!INA.begin()) {
+    Serial.println("ERROR: INA226 not found! Check wiring.");
+  }
+
+  /* USER SET VALUES - Sesuaikan dengan setup Anda */
+  float maxCurrent = 20.0;
+  float shunt = 0.00376203768283880646238095238095;
+  bool normalized = true;
+  g_bus_voltage_offset = 0.0;
+  g_bus_voltage_multiplier = 1.0;
+
+  Serial.println("\n***** INA226 KALIBRASI *****");
+  int result = INA.setMaxCurrentShunt(maxCurrent, shunt, normalized);
+
+  if (result == 0) {
+    Serial.println("Kalibrasi berhasil!");
+  } else {
+    Serial.print("Kalibrasi gagal! Error: ");
+    Serial.println(result);
+  }
+
+  Serial.print("Shunt: ");
+  Serial.print(INA.getShunt(), 4);
+  Serial.println(" Ohm");
+  Serial.print("Max Current: ");
+  Serial.print(INA.getMaxCurrent(), 3);
+  Serial.println(" A");
+
+  initialout();
+  initSPIFFS();
+  initWiFi();
+
+  startTime = millis();
+  Serial.println("\n***** MULAI DATA LOGGING *****");
+  Serial.println(
+      "Format: Time(s), Voltage(V), Shunt(mV), Current(mA), Power(mW)");
+}
+
+void loop() {
+  // Check WiFi connection status
+  static unsigned long lastWiFiCheck = 0;
+  if (millis() - lastWiFiCheck > 30000) { // Check setiap 30 detik
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected! Reconnecting...");
+      WiFi.disconnect();
+      WiFi.reconnect();
+    }
+    lastWiFiCheck = millis();
+  }
+
+  readINA226();
+}
+void readINA226() {
+  static unsigned long lastRead = 0;
+  if (millis() - lastRead < 1000)
+    return; // Baca setiap 1 detik
+  lastRead = millis();
+
+  float busVoltage = INA.getBusVoltage();
+  float calibratedBusVoltage =
+      (busVoltage * g_bus_voltage_multiplier) + g_bus_voltage_offset;
+  float shuntVoltage = INA.getShuntVoltage_mV();
+  float current = INA.getCurrent_mA();
+  float power = INA.getPower_mW();
+
+  addDataPoint(calibratedBusVoltage, shuntVoltage, current, power);
+
+  // Print ke serial
+  Serial.print((millis() - startTime) / 1000.0, 1);
+  Serial.print(",");
+  Serial.print(calibratedBusVoltage, 3);
+  Serial.print(",");
+  Serial.print(shuntVoltage, 3);
+  Serial.print(",");
+  Serial.print(current, 3);
+  Serial.print(",");
+  Serial.println(power, 3);
+}
+
+void addDataPoint(float v, float s, float c, float p) {
+  unsigned long timestamp = millis() - startTime;
+
+  // Simpan ke RAM buffer (circular buffer)
+  ramBuffer[ramIndex].timestamp = timestamp;
+  ramBuffer[ramIndex].busVoltage = v;
+  ramBuffer[ramIndex].shuntVoltage = s;
+  ramBuffer[ramIndex].current = c;
+  ramBuffer[ramIndex].power = p;
+
+  // Simpan ke SPIFFS setiap interval
+  if (millis() - lastSPIFFSSave >= SPIFFS_SAVE_INTERVAL) {
+    saveToSPIFFS(ramBuffer[ramIndex]);
+    lastSPIFFSSave = millis();
+  }
+
+  ramIndex = (ramIndex + 1) % MAX_RAM_POINTS;
+  if (ramCount < MAX_RAM_POINTS)
+    ramCount++;
+  totalDataPoints++;
+}
+
+void saveToSPIFFS(DataPoint &dp) {
+  File file = SPIFFS.open(currentLogFile, FILE_APPEND);
+  if (file) {
+    file.print(dp.timestamp / 1000.0, 3);
+    file.print(",");
+    file.print(dp.busVoltage, 3);
+    file.print(",");
+    file.print(dp.shuntVoltage, 3);
+    file.print(",");
+    file.print(dp.current, 3);
+    file.print(",");
+    file.println(dp.power, 3);
+    file.close();
+  }
+}
+
+int countSPIFFSLines() {
+  int count = 0;
+  File file = SPIFFS.open(currentLogFile, FILE_READ);
+  if (file) {
+    while (file.available()) {
+      String line = file.readStringUntil('\n');
+      if (line.length() > 5)
+        count++;
+    }
+    file.close();
+  }
+  return count;
+}
+
+void initSPIFFS() {
+  Serial.println("\n***** INISIALISASI SPIFFS *****");
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed!");
+    return;
+  }
+
+  size_t totalBytes = SPIFFS.totalBytes();
+  size_t usedBytes = SPIFFS.usedBytes();
+  Serial.print("SPIFFS Total: ");
+  Serial.print(totalBytes / 1024);
+  Serial.println(" KB");
+  Serial.print("SPIFFS Used: ");
+  Serial.print(usedBytes / 1024);
+  Serial.println(" KB");
+  Serial.print("SPIFFS Free: ");
+  Serial.print((totalBytes - usedBytes) / 1024);
+  Serial.println(" KB");
+
+  int existingLines = countSPIFFSLines();
+  Serial.print("Existing data points in SPIFFS: ");
+  Serial.println(existingLines);
+}
+
+void initWiFi() {
+  Serial.println("\n***** INISIALISASI WiFi STA *****");
+
+  // Matikan WiFi dulu
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(500);
+
+  // Set WiFi mode ke STA (Station)
+  WiFi.mode(WIFI_STA);
+  delay(500);
+
+  // Set hostname
+  WiFi.setHostname("currentlogger");
+
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(wifi_ssid);
+
+  // Mulai koneksi WiFi
+  WiFi.begin(wifi_ssid, wifi_password);
+
+  // Tunggu sampai terkoneksi (timeout 20 detik)
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("✓ WiFi Connected!");
+    Serial.print("SSID: ");
+    Serial.println(WiFi.SSID());
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("MAC Address: ");
+    Serial.println(WiFi.macAddress());
+    Serial.print("Signal Strength (RSSI): ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+    Serial.print("Gateway: ");
+    Serial.println(WiFi.gatewayIP());
+    Serial.print("Subnet Mask: ");
+    Serial.println(WiFi.subnetMask());
+  } else {
+    Serial.println("ERROR: WiFi Connection Failed!");
+    Serial.println("Please check:");
+    Serial.println("1. SSID and password are correct");
+    Serial.println("2. WiFi router is on and reachable");
+    Serial.println("3. ESP32 is within WiFi range");
+    return;
+  }
+
+  if (MDNS.begin("currentlogger")) {
+    Serial.println("mDNS: http://currentlogger.local");
+  }
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/data", HTTP_GET, handleData);
+  server.on("/info", HTTP_GET, handleInfo);
+  server.on("/download", HTTP_GET, handleDownload);
+  server.on("/clear", HTTP_GET, handleClear);
+
+  server.begin();
+  Serial.println("\nHTTP server started");
+  Serial.println("Access the web interface at:");
+  Serial.println("  http://" + WiFi.localIP().toString());
+  Serial.println("  http://currentlogger.local");
+}
+
+void handleRoot(AsyncWebServerRequest *request) {
+  request->send_P(200, "text/html", index_html);
+}
+
+void handleData(AsyncWebServerRequest *request) {
+  String range = "";
+  if (request->hasParam("range")) {
+    range = request->getParam("range")->value();
+  }
+
+  String json = "{\"ramCount\":" + String(ramCount) +
+                ",\"spiffsCount\":" + String(countSPIFFSLines()) +
+                ",\"points\":[";
+
+  if (range == "all") {
+    // Load all data from SPIFFS (slow for large datasets)
+    File file = SPIFFS.open(currentLogFile, FILE_READ);
+    bool first = true;
+    if (file) {
+      while (file.available()) {
+        String line = file.readStringUntil('\n');
+        if (line.length() < 5)
+          continue;
+
+        int idx1 = line.indexOf(',');
+        int idx2 = line.indexOf(',', idx1 + 1);
+        int idx3 = line.indexOf(',', idx2 + 1);
+        int idx4 = line.indexOf(',', idx3 + 1);
+
+        if (!first)
+          json += ",";
+        json += "{\"t\":" + line.substring(0, idx1) +
+                ",\"v\":" + line.substring(idx1 + 1, idx2) +
+                ",\"s\":" + line.substring(idx2 + 1, idx3) +
+                ",\"c\":" + line.substring(idx3 + 1, idx4) +
+                ",\"p\":" + line.substring(idx4 + 1) + "}";
+        first = false;
+      }
+      file.close();
+    }
+  } else {
+    // Default: return RAM buffer only
+    int startIdx = (ramCount < MAX_RAM_POINTS) ? 0 : ramIndex;
+    int limit = ramCount;
+
+    if (range.length() > 0 && range != "ram") {
+      limit = min((int)range.toInt(), ramCount);
+      startIdx = (ramIndex - limit + MAX_RAM_POINTS) % MAX_RAM_POINTS;
+    }
+
+    for (int i = 0; i < limit; i++) {
+      int idx = (startIdx + i) % MAX_RAM_POINTS;
+      if (i > 0)
+        json += ",";
+      json += "{\"t\":" + String(ramBuffer[idx].timestamp / 1000.0, 1) +
+              ",\"v\":" + String(ramBuffer[idx].busVoltage, 3) +
+              ",\"s\":" + String(ramBuffer[idx].shuntVoltage, 3) +
+              ",\"c\":" + String(ramBuffer[idx].current, 2) +
+              ",\"p\":" + String(ramBuffer[idx].power, 2) + "}";
+    }
+  }
+
+  json += "]}";
+  request->send(200, "application/json", json);
+}
+
+void handleInfo(AsyncWebServerRequest *request) {
+  String json =
+      "{\"freeSpace\":" + String(SPIFFS.totalBytes() - SPIFFS.usedBytes()) +
+      ",\"totalPoints\":" + String(totalDataPoints) + "}";
+  request->send(200, "application/json", json);
+}
+
+void handleDownload(AsyncWebServerRequest *request) {
+  String type = "";
+  if (request->hasParam("type")) {
+    type = request->getParam("type")->value();
+  }
+
+  String csv = "Time(s),Voltage(V),Shunt(mV),Current(mA),Power(mW)\n";
+
+  if (type == "all") {
+    // Download all from SPIFFS
+    File file = SPIFFS.open(currentLogFile, FILE_READ);
+    if (file) {
+      while (file.available()) {
+        csv += file.readStringUntil('\n') + "\n";
+      }
+      file.close();
+    }
+  } else {
+    // Download RAM only
+    int startIdx = (ramCount < MAX_RAM_POINTS) ? 0 : ramIndex;
+    for (int i = 0; i < ramCount; i++) {
+      int idx = (startIdx + i) % MAX_RAM_POINTS;
+      csv += String(ramBuffer[idx].timestamp / 1000.0, 3) + ",";
+      csv += String(ramBuffer[idx].busVoltage, 3) + ",";
+      csv += String(ramBuffer[idx].shuntVoltage, 3) + ",";
+      csv += String(ramBuffer[idx].current, 3) + ",";
+      csv += String(ramBuffer[idx].power, 3) + "\n";
+    }
+  }
+
+  AsyncWebServerResponse *response =
+      request->beginResponse(200, "text/csv", csv);
+  response->addHeader("Content-Disposition",
+                      "attachment; filename=current_log.csv");
+  request->send(response);
+}
+
+void handleClear(AsyncWebServerRequest *request) {
+  ramIndex = 0;
+  ramCount = 0;
+  totalDataPoints = 0;
+  startTime = millis();
+
+  // Clear SPIFFS file
+  SPIFFS.remove(currentLogFile);
+  File file = SPIFFS.open(currentLogFile, FILE_WRITE);
+  if (file)
+    file.close();
+
+  request->send(200, "text/plain", "All data cleared");
+  Serial.println("All data cleared (RAM + SPIFFS)");
+}
+
+void initialout() {
+  pinMode(Buzz, OUTPUT);
+  pinMode(Led, OUTPUT);
+  pinMode(Alert, INPUT);
+
+  digitalWrite(Buzz, LOW);
+  digitalWrite(Led, LOW);
+  delay(500);
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(Buzz, HIGH);
+    digitalWrite(Led, HIGH);
+    delay(200);
+    digitalWrite(Buzz, LOW);
+    digitalWrite(Led, LOW);
+    delay(200);
+  }
+}
