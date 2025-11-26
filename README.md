@@ -110,11 +110,5 @@ logs/*/data_log.csv
 logs/*/
 ```
 
-Pertanyaan selanjutnya
----------------------
-- Mau saya tambahkan BLE write characteristic untuk remote calibration?
-- Mau saya tambahkan penyimpanan kalibrasi ke NVS (persisten across reboot)?
 
----
-README dibuat otomatis. Jika Anda mau, saya bisa menambahkan contoh screenshot, diagram kabel, atau mengubah bahasa menjadi Inggris sepenuhnya.
 # Current-Logger-INA226-ESP32C3
